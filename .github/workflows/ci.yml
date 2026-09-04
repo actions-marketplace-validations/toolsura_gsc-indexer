@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (Go ${{ matrix.go-version }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # go.mod requires go >= 1.25.0 — older toolchains auto-upgrade via
+        # GOTOOLCHAIN, so matrix-testing them is theater. Test 1.25 + latest.
+        go-version: ['1.25', 'stable']
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        # bash on Windows avoids pwsh mangling `./...` (see: "FAIL .out")
+        # and gives us awk for the coverage math on every OS.
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: true
+      - name: Run tests with race detector
+        run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
+      - name: Enforce coverage floor
+        run: |
+          COVERAGE=$(go tool cover -func=coverage.out | awk '/^total/ {gsub("%","",$3); print $3}')
+          echo "Coverage: ${COVERAGE}%"
+          # ponytail: 25% floor for now — ratchet upward as tests are added.
+          awk -v c="$COVERAGE" 'BEGIN { if (c < 25) { print "Coverage " c "% is below 25% floor"; exit 1 } }'
+      - name: Upload coverage
+        uses: codecov/codecov-action@v5
+        if: matrix.go-version == '1.25' && matrix.os == 'ubuntu-latest'
+        with:
+          files: coverage.out
+          flags: unittests
+          fail_ci_if_error: false
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: true
+      # Built from source with the stable toolchain: the action's prebuilt
+      # binaries are built with go1.24 and refuse to load a go 1.25 module.
+      - name: golangci-lint
+        run: |
+          go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+          $(go env GOPATH)/bin/golangci-lint run --timeout=5m
+
+  staticcheck:
+    name: Staticcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: true
+      - name: staticcheck
+        uses: dominikh/staticcheck-action@v1
+        with:
+          version: 'latest'
+          install_go: false
+
+  gosec:
+    name: Security (gosec)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: true
+      - name: gosec
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@latest
+          # Excluded by design for this CLI:
+          # G304/G703 — user-supplied paths (-creds, -diff, -batch, -report)
+          #             are the tool's purpose; a CLI reads/writes where its
+          #             operator points it on their own machine
+          # G704  — taint-analysis false positive: the endpoint is a fixed
+          #         Google API constant; user input only fills a JSON body
+          # G104  — unhandled resp.Body.Close() after a full read is harmless
+          $(go env GOPATH)/bin/gosec -quiet -exclude G104,G304,G703,G704 ./...
+
+  vet:
+    name: Go Vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: true
+      - name: go vet
+        run: go vet ./...
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [test, lint, staticcheck, gosec, vet]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: true
+      - name: Build binary
+        run: go build -v -o gsc-indexer .
+      - name: Verify binary runs
+        run: ./gsc-indexer -h
